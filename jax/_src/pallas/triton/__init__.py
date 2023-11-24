@@ -14,8 +14,9 @@
 
 """Contains Triton-specific pallas modules."""
 
-from jax._src.pallas.triton import lowering
 from jax._src.lib import gpu_triton as triton_kernel_call_lib
+# Import Triton first, to avoid registering the Triton lowering too eagerly.
+from jax._src.pallas.triton import lowering
 
 get_compute_capability = triton_kernel_call_lib.get_compute_capability
 

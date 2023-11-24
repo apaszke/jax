@@ -18,5 +18,14 @@ try:
   get_compute_capability = triton.get_compute_capability
   del triton
 except ImportError as e:
-  raise ImportError("Cannot import Pallas Triton backend. "
-                    "Make sure you've installed jax-triton.") from e
+  pass
+  # raise ImportError("Cannot import Pallas Triton backend. "
+                    # "Make sure you've installed jax-triton.") from e
+
+try:
+  from jax._src.pallas import mosaic
+  def get_compute_capability(*args, **kwargs):
+    raise NotImplementedError
+  del mosaic
+except ImportError:
+  pass
