@@ -57,6 +57,20 @@ py_extension(
 )
 
 py_extension(
+    name = "_mlirExecutionEngine",
+    srcs = [
+        "@llvm-project//mlir:lib/Bindings/Python/ExecutionEngineModule.cpp",
+    ],
+    copts = COPTS,
+    linkopts = LINKOPTS,
+    deps = [
+        "@llvm-project//mlir:CAPIExecutionEngine",
+        "@llvm-project//mlir:MLIRBindingsPythonHeadersAndDeps",
+        "@pybind11",
+    ],
+)
+
+py_extension(
     name = "_mlirDialectsSparseTensor",
     srcs = [
         "@llvm-project//mlir:lib/Bindings/Python/DialectSparseTensor.cpp",
