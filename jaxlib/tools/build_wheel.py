@@ -273,9 +273,15 @@ def prepare_wheel(sources_path: pathlib.Path, *, cpu, include_gpu_plugin_extensi
           "__main__/jaxlib/mlir/dialects/_builtin_ops_gen.py",
           "__main__/jaxlib/mlir/dialects/_chlo_ops_gen.py",
           "__main__/jaxlib/mlir/dialects/_func_ops_gen.py",
+          "__main__/jaxlib/mlir/dialects/_gpu_enum_gen.py",
+          "__main__/jaxlib/mlir/dialects/_gpu_ops_gen.py",
           "__main__/jaxlib/mlir/dialects/_math_ops_gen.py",
           "__main__/jaxlib/mlir/dialects/_memref_ops_gen.py",
           "__main__/jaxlib/mlir/dialects/_mhlo_ops_gen.py",
+          "__main__/jaxlib/mlir/dialects/_nvgpu_enum_gen.py",
+          "__main__/jaxlib/mlir/dialects/_nvgpu_ops_gen.py",
+          "__main__/jaxlib/mlir/dialects/_nvvm_enum_gen.py",
+          "__main__/jaxlib/mlir/dialects/_nvvm_ops_gen.py",
           "__main__/jaxlib/mlir/dialects/_ods_common.py",
           "__main__/jaxlib/mlir/dialects/_scf_ops_gen.py",
           "__main__/jaxlib/mlir/dialects/_sparse_tensor_enum_gen.py",
@@ -290,10 +296,24 @@ def prepare_wheel(sources_path: pathlib.Path, *, cpu, include_gpu_plugin_extensi
           "__main__/jaxlib/mlir/dialects/math.py",
           "__main__/jaxlib/mlir/dialects/memref.py",
           "__main__/jaxlib/mlir/dialects/mhlo.py",
+          "__main__/jaxlib/mlir/dialects/nvgpu.py",
+          "__main__/jaxlib/mlir/dialects/nvvm.py",
           "__main__/jaxlib/mlir/dialects/scf.py",
           "__main__/jaxlib/mlir/dialects/sparse_tensor.py",
           "__main__/jaxlib/mlir/dialects/stablehlo.py",
           "__main__/jaxlib/mlir/dialects/vector.py",
+      ],
+  )
+  copy_runfiles(
+      dst_dir=jaxlib_dir / "mlir" / "dialects" / "gpu",
+      src_files=[
+          "__main__/jaxlib/mlir/dialects/gpu/__init__.py",
+      ],
+  )
+  copy_runfiles(
+      dst_dir=jaxlib_dir / "mlir" / "dialects" / "gpu" / "passes",
+      src_files=[
+          "__main__/jaxlib/mlir/dialects/gpu/passes/__init__.py",
       ],
   )
 

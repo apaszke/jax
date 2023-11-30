@@ -7,7 +7,11 @@
 #include "mlir-c/Dialect/MemRef.h"
 #include "mlir-c/Dialect/SCF.h"
 #include "mlir-c/Dialect/Vector.h"
+#include "mlir-c/Dialect/GPU.h"
+#include "mlir-c/Dialect/NVGPU.h"
+#include "mlir-c/Dialect/NVVM.h"
 #include "mlir-c/Transforms.h"
+#include "mlir-c/Conversion.h"
 #include "mlir/Bindings/Python/PybindAdaptors.h"
 
 #define REGISTER_DIALECT(name) \
@@ -24,6 +28,12 @@ PYBIND11_MODULE(register_jax_dialects, m) {
     REGISTER_DIALECT(memref);
     REGISTER_DIALECT(scf);
     REGISTER_DIALECT(vector);
+    REGISTER_DIALECT(gpu);
+    REGISTER_DIALECT(nvgpu);
+    REGISTER_DIALECT(nvvm);
+    mlirRegisterGPUPasses();
+    mlirRegisterMemRefPasses();
+    mlirRegisterConversionPasses();
     mlirRegisterTransformsPasses();
     // Transforms used by JAX.
     mlirRegisterTransformsStripDebugInfo();
