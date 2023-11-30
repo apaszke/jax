@@ -521,6 +521,24 @@ pybind_extension(
     ],
 )
 
+cc_binary(
+    name = "libmlir_cuda_runtime.so",
+    srcs = ["@llvm-project//mlir:lib/ExecutionEngine/CudaRuntimeWrappers.cpp"],
+    linkshared = 1,
+    copts = ["-fvisibility=default"],
+    linkopts = select({
+        "@xla//xla/python:use_jax_cuda_pip_rpaths": [
+            "-Wl,-rpath,$$ORIGIN/../../nvidia/cuda_runtime/lib",
+        ],
+        "//conditions:default": [],
+    }),
+    deps = [
+        "@llvm-project//mlir:mlir_c_runner_utils_hdrs",
+        "@local_config_cuda//cuda:cuda_headers",
+        "@tsl//tsl/cuda:cudart",
+    ],
+)
+
 py_library(
     name = "cuda_gpu_support",
     deps = [
@@ -532,6 +550,9 @@ py_library(
         ":_sparse",
         ":_triton",
         ":_versions",
+    ],
+    data = [
+        ":libmlir_cuda_runtime.so",
     ],
 )
 

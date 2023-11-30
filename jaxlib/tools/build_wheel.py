@@ -219,6 +219,10 @@ def prepare_wheel(sources_path: pathlib.Path, *, cpu, include_gpu_plugin_extensi
     )
     copy_runfiles(
         dst_dir=jaxlib_dir / "cuda",
+        src_files=["__main__/jaxlib/cuda/libmlir_cuda_runtime.so"],
+    )
+    copy_runfiles(
+        dst_dir=jaxlib_dir / "cuda",
         src_files=[
             f"__main__/jaxlib/cuda/_solver.{pyext}",
             f"__main__/jaxlib/cuda/_blas.{pyext}",
