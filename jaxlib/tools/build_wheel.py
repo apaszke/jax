@@ -263,6 +263,7 @@ def prepare_wheel(sources_path: pathlib.Path, *, cpu, include_gpu_plugin_extensi
       src_files=[
           "__main__/jaxlib/mlir/ir.py",
           "__main__/jaxlib/mlir/passmanager.py",
+          "__main__/jaxlib/mlir/execution_engine.py",
       ],
   )
   copy_runfiles(
@@ -332,6 +333,7 @@ def prepare_wheel(sources_path: pathlib.Path, *, cpu, include_gpu_plugin_extensi
           f"__main__/jaxlib/mlir/_mlir_libs/_mlir.{pyext}",
           f"__main__/jaxlib/mlir/_mlir_libs/_chlo.{pyext}",
           f"__main__/jaxlib/mlir/_mlir_libs/_mlirHlo.{pyext}",
+          f"__main__/jaxlib/mlir/_mlir_libs/_mlirExecutionEngine.{pyext}",
           f"__main__/jaxlib/mlir/_mlir_libs/_mlirDialectsSparseTensor.{pyext}",
           f"__main__/jaxlib/mlir/_mlir_libs/_mlirSparseTensorPasses.{pyext}",
           f"__main__/jaxlib/mlir/_mlir_libs/_tpu_ext.{pyext}",

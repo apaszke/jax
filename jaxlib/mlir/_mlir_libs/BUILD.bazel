@@ -57,6 +57,21 @@ py_extension(
 )
 
 py_extension(
+    name = "_mlirExecutionEngine",
+    srcs = [
+        "@llvm-project//mlir:lib/Bindings/Python/ExecutionEngineModule.cpp",
+    ],
+    copts = COPTS,
+    linkopts = LINKOPTS,
+    deps = [
+        ":jaxlib_mlir_capi_shared_library",
+        "@llvm-project//mlir:CAPIExecutionEngineHeaders",
+        "@llvm-project//mlir:MLIRBindingsPythonHeadersAndDeps",
+        "@pybind11",
+    ],
+)
+
+py_extension(
     name = "_mlirGPUPasses",
     srcs = [
         "@llvm-project//mlir:lib/Bindings/Python/GPUPasses.cpp",
@@ -252,6 +267,7 @@ cc_library(
     deps = [
         "//jaxlib/mosaic:tpu_dialect_capi_objects",
         "@llvm-project//mlir:CAPIArithObjects",
+        "@llvm-project//mlir:CAPIExecutionEngineObjects",
         "@llvm-project//mlir:CAPIIRObjects",
         "@llvm-project//mlir:CAPIGPUObjects",
         "@llvm-project//mlir:CAPIMathObjects",
