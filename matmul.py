@@ -1,3 +1,4 @@
+import numpy as np
 import pathlib
 import jaxlib
 from jaxlib.mlir import ir
@@ -45,15 +46,16 @@ with ir.Context() as ctx, ir.Location.unknown():
   f16 = ir.F16Type.get()
   f32 = ir.F32Type.get()
   index = ir.IndexType.get()
+  i8 = ir.IntegerType.get_signless(8)
   i32 = ir.IntegerType.get_signless(32)
   i64 = ir.IntegerType.get_signless(64)
-  smem = ir.IntegerAttr.get(i64, 3)
+  smem = ir.Attribute.parse("#gpu.address_space<workgroup>")
 
   m = ir.Module.create()
   with ir.InsertionPoint(m.body):
-    empty_smem_f16_ty = ir.TypeAttr.get(ir.MemRefType.get((0,), f16, memory_space=smem))
-    dynamic_smem_global = memref.GlobalOp("dynamicSmem", empty_smem_f16_ty, sym_visibility="private", alignment=16)
-    acc_smem_global = memref.GlobalOp("accSmem", ir.TypeAttr.get(ir.MemRefType.get((0,), f32, memory_space=smem)), sym_visibility="private", alignment=16)
+    # empty_smem_f16_ty = ir.TypeAttr.get(ir.MemRefType.get((0,), f16, memory_space=smem))
+    # dynamic_smem_global = memref.GlobalOp("dynamicSmem", empty_smem_f16_ty, sym_visibility="private", alignment=16)
+    # acc_smem_global = memref.GlobalOp("accSmem", ir.TypeAttr.get(ir.MemRefType.get((0,), f32, memory_space=smem)), sym_visibility="private", alignment=16)
 
     @func.FuncOp.from_py_func()
     def main():
@@ -91,21 +93,15 @@ with ir.Context() as ctx, ir.Location.unknown():
       launch_op.body.blocks.append(*([index] * 12))  # Append an empty block
       with ir.InsertionPoint(launch_op.body.blocks[0]):
         memref.AssumeAlignmentOp(c_device, 16)
-        dynamic_smem = memref.GetGlobalOp(dynamic_smem_global.type_.value, "dynamicSmem")
-        a_smem_strides = strides([2, *lhs_tile_shape])
-        a_smem = memref.ReinterpretCastOp(
+        dynamic_smem = gpu.DynamicSharedMemoryOp(
+            ir.MemRefType.get((DYNAMIC,), i8, memory_space=smem))
+        a_smem = memref.ViewOp(
             ir.MemRefType.get((2, *lhs_tile_shape), f16, memory_space=smem),
-            dynamic_smem, [], [], [],
-            [0], [2, *lhs_tile_shape], a_smem_strides)
-        b_smem_strides = strides([4, *rhs_tile_shape])
-        b_smem = memref.ReinterpretCastOp(
-            ir.MemRefType.get((4, *rhs_tile_shape), f16, memory_space=smem),
-            dynamic_smem, [], [], [],
-            [0], [4, *rhs_tile_shape], b_smem_strides)
-        b_smem = memref.SubViewOp(
-            ir.Type.parse("memref<2x64x128xf16, strided<[8192, 128, 1], offset: 16384>, 3>"),
-            b_smem, [], [], [],
-            [2, 0, 0], [2, *rhs_tile_shape], [1, 1, 1])
+            dynamic_smem, c(0), [])
+        a_smem_size = int(2 * 2 * np.prod(lhs_tile_shape))  # * 2 for f16
+        # b_smem = memref.ViewOp(
+            # ir.MemRefType.get((2, *rhs_tile_shape), f16, memory_space=smem),
+            # dynamic_smem, c(a_smem_size), [])
 
         tidx = gpu.ThreadIdOp(gpu.Dimension.x)
         is_leader = arith.CmpIOp(arith.CmpIPredicate.eq, tidx, c(0))
@@ -116,73 +112,89 @@ with ir.Context() as ctx, ir.Location.unknown():
         for desc in tma_descs:
           nvgpu.TmaPrefetchOp(desc)
 
-        def fetch(step: int | ir.Value):
-          if isinstance(step, int):
-            step = c(step)
-          txcount = c(32768)
-          if_op = scf.IfOp(is_leader)
-          with ir.InsertionPoint(if_op.then_block):
-            nvgpu.MBarrierArriveExpectTxOp(barrier_group, txcount, step)
-            a_slice = memref.SubViewOp(
-                ir.Type.parse("memref<128x64xf16, strided<[64, 1], offset: ?>, 3>"),
-                a_smem, [step], [], [], [DYNAMIC, 0, 0], [1, *lhs_tile_shape], [1, 1, 1])
-            # TODO: Coordinates seem wrong!!!
-            nvgpu.TmaAsyncLoadOp(
-                a_slice, barrier_group, a_tma_desc,
-                coordinates=[arith.MulIOp(c(64), step), c(0)],
-                mbarId=step)
-            for b_start in (0, 64):
-                b_slice = memref.SubViewOp(
-                    ir.Type.parse("memref<64x64xf16, strided<[128, 1], offset: ?>, 3>"),
-                    b_smem, [step], [], [], [DYNAMIC, b_start, 0], [1, *rhs_tma_shape], [1, 1, 1])
-                nvgpu.TmaAsyncLoadOp(
-                    b_slice, barrier_group, b_tma_desc,
-                    coordinates=[c(b_start), arith.MulIOp(c(64), step)],
-                    mbarId=step)
-            scf.YieldOp([])
-
-        fetch(0)
-        fetch(1)
-        acc = nvgpu.WarpgroupMmaInitAccumulatorOp(acc_ty).result
-
-        for_op = scf.ForOp(c(0), c(2), c(1), [acc])
-        with ir.InsertionPoint(for_op.body):
-          i = for_op.induction_variable
-          (carry_acc,) = for_op.inner_iter_args
-          ticks = c(10000000)
-          nvgpu.MBarrierTryWaitParityOp(barrier_group, c(0), ticks, mbarId=i)
+        step = c(0)
+        if_op = scf.IfOp(is_leader)
+        lhs_layout = ir.Attribute.parse("strided<[64, 1], offset: ?>")
+        with ir.InsertionPoint(if_op.then_block):
+          nvgpu.MBarrierArriveExpectTxOp(barrier_group, c(128*64*2), step)
           a_slice = memref.SubViewOp(
-              ir.Type.parse("memref<128x64xf16, strided<[64, 1], offset: ?>, 3>"),
-              a_smem, [i], [], [], [DYNAMIC, 0, 0], [1, 128, 64], [1, 1, 1])
-          b_slice = memref.SubViewOp(
-              ir.Type.parse("memref<64x128xf16, strided<[128, 1], offset: ?>, 3>"),
-              b_smem, [i], [], [], [DYNAMIC, 0, 0], [1, 64, 128], [1, 1, 1])
-          da = nvgpu.WarpgroupGenerateDescriptorOp(
-              ir.Type.parse("!nvgpu.warpgroup.descriptor<tensor=memref<128x64xf16, 3>>"),
-              a_slice, a_tma_desc)
-          db = nvgpu.WarpgroupGenerateDescriptorOp(
-              ir.Type.parse("!nvgpu.warpgroup.descriptor<tensor=memref<64x128xf16, 3>>"),
-              b_slice, b_tma_desc)
-          new_acc = nvgpu.WarpgroupMmaOp(acc.type, da, db, carry_acc, transposeB=True)
-          scf.YieldOp(new_acc)
-        acc = for_op.result
-        """
-        nvvm.wgmma.wait.group.sync.aligned 0  // Step 7. Wait all to finish mma
-        """
-        acc_smem = memref.GetGlobalOp(acc_smem_global.type_.value, "accSmem")
-        acc_smem = memref.ReinterpretCastOp(
-            ir.MemRefType.get((128, 128), f32, memory_space=smem),
-            acc_smem, [], [], [], [0], [128, 128], [128, 1])
-        nvgpu.WarpgroupMmaStoreOp(acc, acc_smem)
-
-        warp = arith.DivUIOp(tidx, c(32))
-        within_warp = arith.RemUIOp(tidx, c(32))
-        off =  arith.MulIOp(within_warp, c(4))
-        for_op = scf.ForOp(warp, c(128), c(4))
-        with ir.InsertionPoint(for_op.body):
-          acc_part = vector.LoadOp(ir.VectorType.get((4,), f32), acc_smem, [for_op.induction_variable, off])
-          vector.StoreOp(acc_part, c_device, [for_op.induction_variable, off])
+              ir.MemRefType.get(lhs_tma_shape, f16, lhs_layout, smem),
+              a_smem, [c(0)], [], [], [DYNAMIC, 0, 0], [1, *lhs_tile_shape], [1, 1, 1])
+          nvgpu.TmaAsyncLoadOp(
+              a_slice, barrier_group, a_tma_desc,
+              coordinates=[c(0), c(0)], mbarId=step)
           scf.YieldOp([])
+        ticks = c(10000000)
+        nvgpu.MBarrierTryWaitParityOp(barrier_group, c(0), ticks, mbarId=step)
+
+        # def fetch(step: int | ir.Value):
+          # if isinstance(step, int):
+            # step = c(step)
+          # txcount = c(32768)
+          # if_op = scf.IfOp(is_leader)
+          # with ir.InsertionPoint(if_op.then_block):
+            # gpu.PrintfOp("PRINTING\n", [])
+            # nvgpu.MBarrierArriveExpectTxOp(barrier_group, txcount, step)
+            # a_slice = memref.SubViewOp(
+                # ir.Type.parse("memref<128x64xf16, strided<[64, 1], offset: ?>, 3>"),
+                # a_smem, [step], [], [], [DYNAMIC, 0, 0], [1, *lhs_tile_shape], [1, 1, 1])
+            # # TODO: Coordinates seem wrong!!!
+            # nvgpu.TmaAsyncLoadOp(
+                # a_slice, barrier_group, a_tma_desc,
+                # coordinates=[arith.MulIOp(c(64), step), c(0)],
+                # mbarId=step)
+            # for b_start in (0, 64):
+                # b_slice = memref.SubViewOp(
+                    # ir.Type.parse("memref<64x64xf16, strided<[128, 1], offset: ?>, 3>"),
+                    # b_smem, [step], [], [], [DYNAMIC, b_start, 0], [1, *rhs_tma_shape], [1, 1, 1])
+                # nvgpu.TmaAsyncLoadOp(
+                    # b_slice, barrier_group, b_tma_desc,
+                    # coordinates=[c(b_start), arith.MulIOp(c(64), step)],
+                    # mbarId=step)
+            # scf.YieldOp([])
+
+        # fetch(0)
+        # fetch(1)
+        # acc = nvgpu.WarpgroupMmaInitAccumulatorOp(acc_ty).result
+
+        # for_op = scf.ForOp(c(0), c(2), c(1), [acc])
+        # with ir.InsertionPoint(for_op.body):
+          # i = for_op.induction_variable
+          # (carry_acc,) = for_op.inner_iter_args
+          # ticks = c(10000000)
+          # nvgpu.MBarrierTryWaitParityOp(barrier_group, c(0), ticks, mbarId=i)
+          # a_slice = memref.SubViewOp(
+              # ir.Type.parse("memref<128x64xf16, strided<[64, 1], offset: ?>, 3>"),
+              # a_smem, [i], [], [], [DYNAMIC, 0, 0], [1, 128, 64], [1, 1, 1])
+          # b_slice = memref.SubViewOp(
+              # ir.Type.parse("memref<64x128xf16, strided<[128, 1], offset: ?>, 3>"),
+              # b_smem, [i], [], [], [DYNAMIC, 0, 0], [1, 64, 128], [1, 1, 1])
+          # da = nvgpu.WarpgroupGenerateDescriptorOp(
+              # ir.Type.parse("!nvgpu.warpgroup.descriptor<tensor=memref<128x64xf16, 3>>"),
+              # a_slice, a_tma_desc)
+          # db = nvgpu.WarpgroupGenerateDescriptorOp(
+              # ir.Type.parse("!nvgpu.warpgroup.descriptor<tensor=memref<64x128xf16, 3>>"),
+              # b_slice, b_tma_desc)
+          # new_acc = nvgpu.WarpgroupMmaOp(acc.type, da, db, carry_acc, transposeB=True)
+          # scf.YieldOp(new_acc)
+        # acc = for_op.result
+        # """
+        # nvvm.wgmma.wait.group.sync.aligned 0  // Step 7. Wait all to finish mma
+        # """
+        # acc_smem = memref.GetGlobalOp(acc_smem_global.type_.value, "accSmem")
+        # acc_smem = memref.ReinterpretCastOp(
+            # ir.MemRefType.get((128, 128), f32, memory_space=smem),
+            # acc_smem, [], [], [], [0], [128, 128], [128, 1])
+        # nvgpu.WarpgroupMmaStoreOp(acc, acc_smem)
+
+        # warp = arith.DivUIOp(tidx, c(32))
+        # within_warp = arith.RemUIOp(tidx, c(32))
+        # off =  arith.MulIOp(within_warp, c(4))
+        # for_op = scf.ForOp(warp, c(128), c(4))
+        # with ir.InsertionPoint(for_op.body):
+          # acc_part = vector.LoadOp(ir.VectorType.get((4,), f32), acc_smem, [for_op.induction_variable, off])
+          # vector.StoreOp(acc_part, c_device, [for_op.induction_variable, off])
+          # scf.YieldOp([])
 
         gpu.TerminatorOp()
       gpu.MemcpyOp(token_ty, [token], c_host, c_device)
@@ -213,14 +225,14 @@ with ir.Context() as ctx, ir.Location.unknown():
     "cse",
     "gpu.module(strip-debuginfo)",
     "gpu.module(convert-gpu-to-nvvm{has-redux=false index-bitwidth=64 use-bare-ptr-memref-call-conv=false})",
-    "gpu.module(canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=true test-convergence=false top-down=true})",
-    "gpu.module(cse)",
-    "gpu.module(reconcile-unrealized-casts)",
-    "gpu-to-llvm{gpu-binary-annotation=gpu.binary use-bare-pointers-for-host=false use-bare-pointers-for-kernels=false}",
-    "gpu-module-to-binary{format=fatbin}",
-    "canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=true test-convergence=false top-down=true}",
-    "cse",
-    "reconcile-unrealized-casts",
+    # "gpu.module(canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=true test-convergence=false top-down=true})",
+    # "gpu.module(cse)",
+    # "gpu.module(reconcile-unrealized-casts)",
+    # "gpu-to-llvm{gpu-binary-annotation=gpu.binary use-bare-pointers-for-host=false use-bare-pointers-for-kernels=false}",
+    # "gpu-module-to-binary{format=fatbin}",
+    # "canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=true test-convergence=false top-down=true}",
+    # "cse",
+    # "reconcile-unrealized-casts",
   ]
   pass_manager = PassManager.parse(f"builtin.module({','.join(passes)})")
   pass_manager.run(m.operation)
@@ -228,14 +240,14 @@ with ir.Context() as ctx, ir.Location.unknown():
   # ir._GlobalDebug.flag = True
   # pass_manager = PassManager.parse("builtin.module(gpu-module-to-binary{format=assembly})")
   # pass_manager.run(m.operation)
-  # print(m)
+  print(m)
 
-  m.operation.verify()
-  runtime_path = pathlib.Path(jaxlib.__file__).parent / 'cuda' / 'libmlir_cuda_runtime.so'
-  assert runtime_path.exists()
-  print(runtime_path)
-  engine = ExecutionEngine(m, opt_level=3, shared_libs=[str(runtime_path)], enable_object_dump=False)
-  # print(engine)
-  print(engine.invoke("main"))
-  # engine.invoke()
-  print("OK")
+  # m.operation.verify()
+  # runtime_path = pathlib.Path(jaxlib.__file__).parent / 'cuda' / 'libmlir_cuda_runtime.so'
+  # assert runtime_path.exists()
+  # print(runtime_path)
+  # engine = ExecutionEngine(m, opt_level=3, shared_libs=[str(runtime_path)], enable_object_dump=False)
+  # # print(engine)
+  # print(engine.invoke("main"))
+  # # engine.invoke()
+  # print("OK")
