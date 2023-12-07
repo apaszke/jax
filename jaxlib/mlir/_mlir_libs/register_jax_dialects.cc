@@ -13,6 +13,7 @@
 #include "mlir-c/Transforms.h"
 #include "mlir-c/Conversion.h"
 #include "mlir/Bindings/Python/PybindAdaptors.h"
+#include "jaxlib/mlir/_mlir_libs/jaxlib_mlir_capi_shims.h"
 
 #define REGISTER_DIALECT(name) \
     MlirDialectHandle name##_dialect = mlirGetDialectHandle__##name##__(); \
@@ -32,10 +33,12 @@ PYBIND11_MODULE(register_jax_dialects, m) {
     REGISTER_DIALECT(nvgpu);
     REGISTER_DIALECT(nvvm);
     mlirRegisterGPUPasses();
-    mlirRegisterMemRefPasses();
     mlirRegisterConversionPasses();
     mlirRegisterTransformsPasses();
     // Transforms used by JAX.
     mlirRegisterTransformsStripDebugInfo();
+    // TODO: Remove those
+    jaxMlirRegisterMemRefPasses();
+    jaxMlirRegisterInterfaceExternalModels(registry);
   });
 }

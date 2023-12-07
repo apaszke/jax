@@ -167,6 +167,7 @@ py_extension(
     linkopts = LINKOPTS,
     deps = [
         ":jaxlib_mlir_capi_shared_library",
+        ":jaxlib_mlir_capi_shims_hdrs",
         "@llvm-project//mlir:CAPIArithHeaders",
         "@llvm-project//mlir:CAPIGPUHeaders",
         "@llvm-project//mlir:CAPIIRHeaders",
@@ -263,8 +264,33 @@ cc_library(
 )
 
 cc_library(
+    name = "jaxlib_mlir_capi_shims",
+    srcs = ["jaxlib_mlir_capi_shims.cc"],
+    hdrs = ["jaxlib_mlir_capi_shims.h"],
+    deps = [
+        "@llvm-project//mlir:CAPIIRHeaders",
+        "@llvm-project//mlir:MemRefTransforms",
+        "@llvm-project//mlir:NVVMTarget",
+        "@llvm-project//mlir:GPUToLLVMIRTranslation",
+        "@llvm-project//mlir:LLVMToLLVMIRTranslation",
+        "@llvm-project//mlir:NVVMToLLVMIRTranslation",
+    ],
+    alwayslink = 1,
+)
+
+cc_library(
+    name = "jaxlib_mlir_capi_shims_hdrs",
+    hdrs = ["jaxlib_mlir_capi_shims.h"],
+    deps = [
+        "@llvm-project//mlir:CAPIIRHeaders",
+    ],
+)
+
+
+cc_library(
     name = "jaxlib_mlir_capi_objects",
     deps = [
+        ":jaxlib_mlir_capi_shims",
         "//jaxlib/mosaic:tpu_dialect_capi_objects",
         "@llvm-project//mlir:CAPIArithObjects",
         "@llvm-project//mlir:CAPIExecutionEngineObjects",
