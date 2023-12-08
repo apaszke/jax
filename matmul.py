@@ -1,5 +1,8 @@
+import ctypes
 import numpy as np
 import pathlib
+import jax
+import jax.numpy as jnp
 import jaxlib
 from jax._src.interpreters import mlir
 from jaxlib.mlir import ir
@@ -13,7 +16,7 @@ from jaxlib.mlir.dialects import scf
 from jaxlib.mlir.dialects import vector
 from jaxlib.mlir.execution_engine import ExecutionEngine
 from jaxlib.mlir.passmanager import PassManager
-print(memref.__file__)
+from jaxlib.cuda import _mosaic_gpu
 
 DYNAMIC = -9223372036854775808
 
@@ -24,6 +27,75 @@ def strides(xs):
     strides.append(stride)
     stride *= x
   return strides[::-1]
+
+
+mosaic_gpu_p = jax.core.Primitive("mosaic_gpu_p")
+
+
+@mosaic_gpu_p.def_abstract_eval
+def _mosaic_gpu_abstract_eval(*_, module, out_type):
+  return jax._src.core.ShapedArray(out_type.shape, out_type.dtype)
+
+
+def _mosaic_gpu_lowering_rule(ctx, *args, module, out_type):
+  runtime_path = pathlib.Path(jaxlib.__file__).parent / 'cuda' / 'libmlir_cuda_runtime.so'
+  assert runtime_path.exists()
+  engine = ExecutionEngine(module, opt_level=3, shared_libs=[str(runtime_path)], enable_object_dump=False)
+  func_ptr = engine.lookup("main")
+  ptr_bytes = ctypes.cast(func_ptr, ctypes.c_void_p).value.to_bytes(8, byteorder='little')
+  op = mlir.custom_call(
+      "mosaic_gpu",
+      result_types=[mlir.aval_to_ir_type(ctx.avals_out[0])],
+      operands=args,
+      backend_config=ptr_bytes,
+  )
+  return op.results
+
+mlir.register_lowering(mosaic_gpu_p, _mosaic_gpu_lowering_rule)
+
+
+def as_gpu_kernel(m, out_type):
+  m.operation.verify()
+
+  # TODO: Clone the module
+
+  passes = [
+    "convert-nvgpu-to-nvvm",
+    "gpu-kernel-outlining{data-layout-str=}",
+    # "convert-linalg-to-loops",
+    "convert-vector-to-scf{full-unroll=false lower-tensors=false target-rank=1}",
+    "convert-scf-to-cf",
+    "convert-nvvm-to-llvm",
+    "convert-vector-to-llvm{enable-amx=false enable-arm-neon=false enable-arm-sve=false enable-x86vector=false force-32bit-vector-indices=true reassociate-fp-reductions=false}",
+    "convert-math-to-llvm{approximate-log1p=true}",
+    "finalize-memref-to-llvm{index-bitwidth=0 use-aligned-alloc=false use-generic-functions=false}",
+    "convert-func-to-llvm{index-bitwidth=0 use-bare-ptr-memref-call-conv=false}",
+    "expand-strided-metadata",
+    "nvvm-attach-target{O=3 chip=sm_90a fast=false features=+ptx80 ftz=false  module= triple=nvptx64-nvidia-cuda}",
+    "lower-affine",
+    "convert-arith-to-llvm{index-bitwidth=0}",
+    "convert-index-to-llvm{index-bitwidth=64}",
+    "canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=true test-convergence=false top-down=true}",
+    "cse",
+    "gpu.module(strip-debuginfo)",
+    "gpu.module(convert-gpu-to-nvvm{has-redux=false index-bitwidth=64 use-bare-ptr-memref-call-conv=false})",
+    "gpu.module(canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=true test-convergence=false top-down=true})",
+    "gpu.module(cse)",
+    "gpu.module(reconcile-unrealized-casts)",
+    "gpu-to-llvm{gpu-binary-annotation=gpu.binary use-bare-pointers-for-host=false use-bare-pointers-for-kernels=false}",
+    "gpu-module-to-binary{format=fatbin}",
+    "canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=true test-convergence=false top-down=true}",
+    "cse",
+    "reconcile-unrealized-casts",
+  ]
+  pass_manager = PassManager.parse(f"builtin.module({','.join(passes)})")
+  pass_manager.run(m.operation)
+
+  @jax.jit
+  def kernel(*args):
+    return mosaic_gpu_p.bind(*args, out_type=out_type, module=m)
+  return kernel
+
 
 
 with mlir.make_ir_context() as ctx, ir.Location.unknown():
@@ -180,8 +252,8 @@ with mlir.make_ir_context() as ctx, ir.Location.unknown():
         off =  arith.MulIOp(within_warp, c(4))
         for_op = scf.ForOp(warp, c(128), c(4))
         with ir.InsertionPoint(for_op.body):
-          acc_part = vector.LoadOp(ir.VectorType.get((4,), f32), acc_smem, [for_op.induction_variable, off])
-          vector.StoreOp(acc_part, c_device, [for_op.induction_variable, off])
+          # acc_part = vector.LoadOp(ir.VectorType.get((4,), f32), acc_smem, [for_op.induction_variable, off])
+          # vector.StoreOp(acc_part, c_device, [for_op.induction_variable, off])
           scf.YieldOp([])
 
         gpu.TerminatorOp()
@@ -191,54 +263,52 @@ with mlir.make_ir_context() as ctx, ir.Location.unknown():
   main.func_op.attributes["llvm.emit_c_interface"] = ir.UnitAttr.get()
   m.operation.verify()
 
-  passes = [
-    "convert-nvgpu-to-nvvm",
-    "gpu-kernel-outlining{data-layout-str=}",
-    # "convert-linalg-to-loops",
-    "convert-vector-to-scf{full-unroll=false lower-tensors=false target-rank=1}",
-    "convert-scf-to-cf",
-    "convert-nvvm-to-llvm",
-    "convert-vector-to-llvm{enable-amx=false enable-arm-neon=false enable-arm-sve=false enable-x86vector=false force-32bit-vector-indices=true reassociate-fp-reductions=false}",
-    "convert-math-to-llvm{approximate-log1p=true}",
-    "finalize-memref-to-llvm{index-bitwidth=0 use-aligned-alloc=false use-generic-functions=false}",
-    "convert-func-to-llvm{index-bitwidth=0 use-bare-ptr-memref-call-conv=false}",
-    "expand-strided-metadata",
-    "nvvm-attach-target{O=3 chip=sm_90a fast=false features=+ptx80 ftz=false  module= triple=nvptx64-nvidia-cuda}",
-    "lower-affine",
-    "convert-arith-to-llvm{index-bitwidth=0}",
-    "convert-index-to-llvm{index-bitwidth=64}",
-    "canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=true test-convergence=false top-down=true}",
-    "cse",
-    "gpu.module(strip-debuginfo)",
-    "gpu.module(convert-gpu-to-nvvm{has-redux=false index-bitwidth=64 use-bare-ptr-memref-call-conv=false})",
-    "gpu.module(canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=true test-convergence=false top-down=true})",
-    "gpu.module(cse)",
-    "gpu.module(reconcile-unrealized-casts)",
-    "gpu-to-llvm{gpu-binary-annotation=gpu.binary use-bare-pointers-for-host=false use-bare-pointers-for-kernels=false}",
-    "gpu-module-to-binary{format=fatbin}",
-    "canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=true test-convergence=false top-down=true}",
-    "cse",
-    "reconcile-unrealized-casts",
-  ]
-  pass_manager = PassManager.parse(f"builtin.module({','.join(passes)})")
-  pass_manager.run(m.operation)
+  # passes = [
+    # "convert-nvgpu-to-nvvm",
+    # "gpu-kernel-outlining{data-layout-str=}",
+    # # "convert-linalg-to-loops",
+    # "convert-vector-to-scf{full-unroll=false lower-tensors=false target-rank=1}",
+    # "convert-scf-to-cf",
+    # "convert-nvvm-to-llvm",
+    # "convert-vector-to-llvm{enable-amx=false enable-arm-neon=false enable-arm-sve=false enable-x86vector=false force-32bit-vector-indices=true reassociate-fp-reductions=false}",
+    # "convert-math-to-llvm{approximate-log1p=true}",
+    # "finalize-memref-to-llvm{index-bitwidth=0 use-aligned-alloc=false use-generic-functions=false}",
+    # "convert-func-to-llvm{index-bitwidth=0 use-bare-ptr-memref-call-conv=false}",
+    # "expand-strided-metadata",
+    # "nvvm-attach-target{O=3 chip=sm_90a fast=false features=+ptx80 ftz=false  module= triple=nvptx64-nvidia-cuda}",
+    # "lower-affine",
+    # "convert-arith-to-llvm{index-bitwidth=0}",
+    # "convert-index-to-llvm{index-bitwidth=64}",
+    # "canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=true test-convergence=false top-down=true}",
+    # "cse",
+    # "gpu.module(strip-debuginfo)",
+    # "gpu.module(convert-gpu-to-nvvm{has-redux=false index-bitwidth=64 use-bare-ptr-memref-call-conv=false})",
+    # "gpu.module(canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=true test-convergence=false top-down=true})",
+    # "gpu.module(cse)",
+    # "gpu.module(reconcile-unrealized-casts)",
+    # "gpu-to-llvm{gpu-binary-annotation=gpu.binary use-bare-pointers-for-host=false use-bare-pointers-for-kernels=false}",
+    # "gpu-module-to-binary{format=fatbin}",
+    # "canonicalize{  max-iterations=10 max-num-rewrites=-1 region-simplify=true test-convergence=false top-down=true}",
+    # "cse",
+    # "reconcile-unrealized-casts",
+  # ]
+  # pass_manager = PassManager.parse(f"builtin.module({','.join(passes)})")
+  # pass_manager.run(m.operation)
 
-  debug_passes = [
-    # "gpu.module(convert-gpu-to-nvvm)",
-  ]
-  if debug_passes:
-    ir._GlobalDebug.flag = True
-    try:
-      pass_manager = PassManager.parse(f"builtin.module({','.join(debug_passes)})")
-      pass_manager.run(m.operation)
-    finally:
-      ir._GlobalDebug.flag = False
+  module = m
 
-  m.operation.verify()
-  runtime_path = pathlib.Path(jaxlib.__file__).parent / 'cuda' / 'libmlir_cuda_runtime.so'
-  assert runtime_path.exists()
-  engine = ExecutionEngine(m, opt_level=3, shared_libs=[str(runtime_path)], enable_object_dump=False)
-  # # print(engine)
-  engine.invoke("main")
-  # # engine.invoke()
-  print("OK")
+  # main.func_op.attributes["llvm.emit_c_interface"] = ir.UnitAttr.get()
+  n, k, m = 4096, 4096, 4096
+  x = jnp.ones((n, k), dtype=jnp.float16)
+  y = jnp.ones((k, m), dtype=jnp.float16)
+  f = as_gpu_kernel(module, jax.ShapeDtypeStruct((n, m), jnp.float32))
+  f(x, y)
+
+  # m.operation.verify()
+  # runtime_path = pathlib.Path(jaxlib.__file__).parent / 'cuda' / 'libmlir_cuda_runtime.so'
+  # assert runtime_path.exists()
+  # engine = ExecutionEngine(m, opt_level=3, shared_libs=[str(runtime_path)], enable_object_dump=False)
+  # # # print(engine)
+  # engine.invoke("main")
+  # # # engine.invoke()
+  # print("OK")

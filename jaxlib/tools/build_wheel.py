@@ -224,6 +224,7 @@ def prepare_wheel(sources_path: pathlib.Path, *, cpu, include_gpu_plugin_extensi
     copy_runfiles(
         dst_dir=jaxlib_dir / "cuda",
         src_files=[
+            f"__main__/jaxlib/cuda/_mosaic_gpu.{pyext}",
             f"__main__/jaxlib/cuda/_solver.{pyext}",
             f"__main__/jaxlib/cuda/_blas.{pyext}",
             f"__main__/jaxlib/cuda/_linalg.{pyext}",

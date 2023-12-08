@@ -539,6 +539,32 @@ cc_binary(
     ],
 )
 
+pybind_extension(
+    name = "_mosaic_gpu",
+    srcs = ["mosaic_gpu.cc"],
+    copts = [
+        "-fexceptions",
+        "-fno-strict-aliasing",
+    ],
+    features = ["-use_header_modules"],
+    linkopts = select({
+        "@xla//xla/python:use_jax_cuda_pip_rpaths": [
+            "-Wl,-rpath,$$ORIGIN/../../nvidia/cuda_runtime/lib",
+        ],
+        "//conditions:default": [],
+    }),
+    module_name = "_mosaic_gpu",
+    deps = [
+        ":cuda_vendor",
+        "//jaxlib:kernel_nanobind_helpers",
+        "@tsl//tsl/cuda:cudart",
+        "@tsl//tsl/cuda:cupti",
+        "@xla//xla/service:custom_call_status",
+        "@xla//xla/service:custom_call_target_registry",
+        "@nanobind",
+    ],
+)
+
 py_library(
     name = "cuda_gpu_support",
     deps = [
@@ -550,6 +576,7 @@ py_library(
         ":_sparse",
         ":_triton",
         ":_versions",
+        ":_mosaic_gpu",
     ],
     data = [
         ":libmlir_cuda_runtime.so",
