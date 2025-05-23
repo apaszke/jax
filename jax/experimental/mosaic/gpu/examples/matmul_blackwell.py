@@ -23,6 +23,7 @@ from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import arith
 from jax._src.lib.mlir.dialects import gpu
 from jax._src.lib.mlir.dialects import nvvm
+from jax._src.lib.mlir.dialects import llvm
 from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.mosaic.gpu import c, ds
 from jax.experimental.mosaic.gpu import tcgen05
@@ -79,7 +80,7 @@ def build_kernel(
     raise ValueError(f"{m=} // {tile_m=} must be divisible by {grid_tile_m=}")
 
   def kernel(ctx, a, b, d, smem):
-    ((a_smem, b_smem), d_smem), barriers, mma_done_barrier, acc = smem
+    ((a_smem, b_smem), d_smem), barriers, mma_done_barrier, tmem_read_done_barrier, acc = smem
     (ab_full_barriers, ab_empty_barriers) = barriers
 
     warp_idx = mgpu.warp_idx(sync=True)
@@ -97,9 +98,9 @@ def build_kernel(
         arith.index_castui(index, extra_step))
 
     @mgpu.fori(mn_steps, None)
-    def mn_loop(idx, _):
+    def mn_loop(mn_step_idx, _):
       # NOTE: we interpret the logical grid in column-major order
-      idx = arith.addi(sm_id, arith.muli(idx, mgpu.c(num_sms, index)))
+      idx = arith.addi(sm_id, arith.muli(mn_step_idx, mgpu.c(num_sms, index)))
       logical_idxs = []
       for dim_size in logical_grid:
         logical_idxs.append(arith.remui(idx, mgpu.c(dim_size, index)))
@@ -116,6 +117,7 @@ def build_kernel(
       n_start = arith.muli(n_idx, c(tile_n,index))
 
       with mgpu.when(is_leader_of(TMA_WARP)):
+        # XXX: THIS NO LONGER WAITS FOR THE LAST TC STEP!!! FIX THIS
         @mgpu.fori(c(k_loop_iter, index), None)
         def _tma_body(ki, _):
           slot = arith.remui(ki, c(max_concurrent_steps, index))
@@ -155,6 +157,9 @@ def build_kernel(
           ab_empty_barriers[slot].wait()
 
       with mgpu.when(arith.andi(is_leader_of(MMA_WARP), is_leader_block)):
+        with mgpu.when(arith.cmpi(arith.CmpIPredicate.ne, mn_step_idx, c(0, index))):
+          tmem_read_done_barrier.wait()
+          llvm.inline_asm(ir.Type.parse("!llvm.void"), [], "tcgen05.fence::after_thread_sync;", "", has_side_effects=True)
         @mgpu.fori(c(k_loop_iter, index), arith.constant(i1, 0))
         def _mma_body(ki, accumulate):
           slot = arith.remui(ki, c(max_concurrent_steps, index))
@@ -180,20 +185,31 @@ def build_kernel(
           tcgen05.commit_arrive(barrier_ptr, collective=collective, ctx=ctx)
           return accumulate
 
-      gpu.barrier()
-      mma_done_barrier.wait(for_tensor_core=True)
+      # Second warpgroup
+      with mgpu.when(arith.cmpi(arith.CmpIPredicate.uge, warp_idx, c(4, i32))):
+        mma_done_barrier.wait(for_tensor_core=True)
+        # We need to pack before we signal or else we will run out of registers.
+        final_acc = acc.load().astype(ir.F16Type.get())
+        final_acc = mgpu.optimization_barrier(final_acc)
+        assert tile_n % epilogue_tile_n == 0
+        for i in range(tile_n // epilogue_tile_n):
+          final_acc[:, ds(i * epilogue_tile_n, epilogue_tile_n)].store_tiled(d_smem, swizzle=swizzle)
+          if i == 0:
+            llvm.inline_asm(ir.Type.parse("!llvm.void"), [], "tcgen05.wait::ld.sync.aligned;", "", has_side_effects=True)
+            llvm.inline_asm(ir.Type.parse("!llvm.void"), [], "tcgen05.fence::before_thread_sync;", "", has_side_effects=True)
+            tmem_read_done_barrier.arrive()
+          mgpu.commit_shared()
+          store_n_start = arith.addi(n_start, c(i * epilogue_tile_n, index))
+          ctx.async_copy(
+              src_ref=d_smem,
+              dst_ref=d,
+              gmem_slice=(ds(block_m_start, block_tile_m), ds(store_n_start, epilogue_tile_n)),
+              gmem_transform=mgpu.TileTransform((128, swizzle_elems)),
+              swizzle=swizzle,
+          )
+          ctx.await_async_copy(0, await_read_only=True)
 
-      acc.load().astype(ir.F16Type.get()).store_tiled(d_smem, swizzle=128)
-      mgpu.commit_shared()
-      ctx.async_copy(
-          src_ref=d_smem,
-          dst_ref=d,
-          gmem_slice=(ds(block_m_start, block_tile_m), ds(n_start, tile_n)),
-          gmem_transform=mgpu.TileTransform((128, swizzle_elems)),
-          swizzle=swizzle,
-      )
-      ctx.await_async_copy(0)
-
+  epilogue_tile_n = 128
   compute_buffers = (
     jax.ShapeDtypeStruct(
         mgpu.tile_shape((max_concurrent_steps, block_tile_m, tile_k), tiling),
@@ -203,20 +219,21 @@ def build_kernel(
          jnp.float16),
   )
   epilogue_buffer = jax.ShapeDtypeStruct(
-      mgpu.tile_shape((block_tile_m, tile_n), (128, swizzle_elems)),
+      mgpu.tile_shape((block_tile_m, epilogue_tile_n), (128, swizzle_elems)),
       jnp.float16)
-  smem_buffers = mgpu.Union([compute_buffers, epilogue_buffer])
+  smem_buffers = [compute_buffers, epilogue_buffer]
   smem = (
       smem_buffers,
       [mgpu.Barrier(arrival_count=1, num_barriers=max_concurrent_steps)] * 2,
       mgpu.Barrier(arrival_count=1),
+      mgpu.Barrier(arrival_count=128),
       mgpu.TMEM((128, tile_n), jnp.float32, collective=collective),
   )
   num_sms = 148
   return mgpu.as_gpu_kernel(
       kernel,
       (num_sms, 1, 1),
-      (128, 1, 1),
+      (2 * 128, 1, 1),
       (
           jax.ShapeDtypeStruct((m, k), jnp.float16),
           jax.ShapeDtypeStruct((n, k), jnp.float16),
@@ -235,42 +252,45 @@ def main(unused_argv):
   b = jr.normal(key=kb, shape=(n, k), dtype=jnp.float16)
 
   tile_m = (128,)
-  tile_n = (128, 256, 512)
+  tile_n = (128, 256,)
   max_concurrent_steps = (2, 4, 5, 6)
   grid_tile_m = (1, 2, 4, 8, 16)
-  collective = (False, True)
+  collective = (True,)
   configs = itertools.product(collective, tile_m, tile_n, grid_tile_m, max_concurrent_steps)
   names = ("collective", "tile_m", "tile_n", "grid_tile_m", "max_concurrent_steps")
   best_runtime = float("inf")
   best_kwargs = {}
-  for config in configs:
-    kwargs = dict(zip(names, config))
-    tile_m = kwargs["tile_m"]
-    tile_n = kwargs["tile_n"]
-    if kwargs["collective"]:
-      tile_m *= 2
-      tile_n *= 2
-    if m < tile_m or n < tile_n:
-      continue
-    if tile_n > 512:
-      continue
-    if (m // tile_m) % kwargs["grid_tile_m"]:
-      continue
-    try:
-      with mlir.make_ir_context(), ir.Location.unknown():
-        f = build_kernel(m, n, k, **kwargs)
-        _, runtime = profiler.measure(f)(a, b)
-    except ValueError as e:
-      if "Mosaic GPU kernel exceeds available shared memory" not in str(e):
-        raise
-      runtime = float("inf")
-    else:
-      print(" ".join(f"{k}={v}" for k, v in kwargs.items()), int(runtime * 1000))
-    if runtime < best_runtime:
-      best_runtime = runtime
-      best_kwargs = kwargs
-  if not best_kwargs:
-    raise ValueError("No valid configuration found")
+  # for config in configs:
+  #   kwargs = dict(zip(names, config))
+  #   tile_m = kwargs["tile_m"]
+  #   tile_n = kwargs["tile_n"]
+  #   if kwargs["collective"]:
+  #     tile_m *= 2
+  #     tile_n *= 2
+  #   if m < tile_m or n < tile_n:
+  #     continue
+  #   if tile_n > 512:
+  #     continue
+  #   if (m // tile_m) % kwargs["grid_tile_m"]:
+  #     continue
+  #   try:
+  #     with mlir.make_ir_context(), ir.Location.unknown():
+  #       f = build_kernel(m, n, k, **kwargs)
+  #       _, runtime = profiler.measure(f)(a, b)
+  #   except ValueError as e:
+  #     if "Mosaic GPU kernel exceeds available shared memory" not in str(e):
+  #       raise
+  #     runtime = float("inf")
+  #   else:
+  #     print(" ".join(f"{k}={v}" for k, v in kwargs.items()), int(runtime * 1000))
+  #   if runtime < best_runtime:
+  #     best_runtime = runtime
+  #     best_kwargs = kwargs
+  # if not best_kwargs:
+  #   raise ValueError("No valid configuration found")
+  best_kwargs = dict(
+    collective=True, tile_m=128, tile_n=256, grid_tile_m=16, max_concurrent_steps=4
+  )
 
   with mlir.make_ir_context(), ir.Location.unknown():
     d, runtime = profiler.measure(build_kernel(m, n, k, **best_kwargs))(a, b)

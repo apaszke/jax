@@ -1376,26 +1376,44 @@ class FragmentedArray:
     )
 
   def __getitem__(self, idx):
-    if self.layout !=  WGMMA_LAYOUT:
-      raise NotImplementedError("Only WGMMA layouts support slicing")
     base_idx, slice_shape, is_squeezed = utils.parse_indices(idx, self.shape)
-    if any(is_squeezed):
-      raise NotImplementedError("Only slicing implemented")
-    if (
-        base_idx[0] % 64
-        or slice_shape[0] % 64
-        or base_idx[1] % 8
-        or slice_shape[1] % 8
-    ):
-      raise NotImplementedError("Only tile aligned slicing supported")
-    base_idx[0] //= 64
-    slice_shape[0] //= 64
-    base_idx[1] //= 8
-    slice_shape[1] //= 8
-    new_regs = self.registers[
-        base_idx[0] : base_idx[0] + slice_shape[0],
-        base_idx[1] : base_idx[1] + slice_shape[1],
-    ]
+    from . import tcgen05
+    if self.layout ==  WGMMA_LAYOUT:
+      if any(is_squeezed):
+        raise NotImplementedError("Only slicing implemented")
+      if (
+          base_idx[0] % 64
+          or slice_shape[0] % 64
+          or base_idx[1] % 8
+          or slice_shape[1] % 8
+      ):
+        raise NotImplementedError("Only tile aligned slicing supported")
+      base_idx[0] //= 64
+      slice_shape[0] //= 64
+      base_idx[1] //= 8
+      slice_shape[1] //= 8
+      new_regs = self.registers[
+          base_idx[0] : base_idx[0] + slice_shape[0],
+          base_idx[1] : base_idx[1] + slice_shape[1],
+      ]
+    elif self.layout == tcgen05.LAYOUT:
+      if any(is_squeezed):
+        raise NotImplementedError("Only slicing implemented")
+      if (
+          base_idx[0] % 64
+          or slice_shape[0] % 64
+          or base_idx[1] % 8
+          or slice_shape[1] % 8
+      ):
+        raise NotImplementedError("Only tile aligned slicing supported")
+      base_idx[0] //= 128
+      slice_shape[0] //= 128
+      base_idx[1] //= 8
+      slice_shape[1] //= 8
+      new_regs = self.registers[
+          base_idx[0] : base_idx[0] + slice_shape[0],
+          base_idx[1] : base_idx[1] + slice_shape[1],
+      ]
     return FragmentedArray(
         _registers=new_regs, _layout=self.layout, _is_signed=self.is_signed
     )
