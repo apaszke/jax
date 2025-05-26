@@ -116,13 +116,17 @@ def build_kernel(
       m_start = arith.muli(arith.divui(block_m_start, c(tile_m, index)), c(tile_m, index))
       n_start = arith.muli(n_idx, c(tile_n,index))
 
+      mn_slot = arith.remui(mn_step_idx, c(2, index))
+      mn_acc = acc.slice(slice(None), mgpu.ds(arith.muli(mn_slot, c(tile_n, index)), tile_n))
+
       with mgpu.when(is_leader_of(TMA_WARP)):
-        # XXX: THIS NO LONGER WAITS FOR THE LAST TC STEP!!! FIX THIS
         @mgpu.fori(c(k_loop_iter, index), None)
         def _tma_body(ki, _):
           slot = arith.remui(ki, c(max_concurrent_steps, index))
           # TODO(apaszke): Use a predicate instead of a conditional.
-          with mgpu.when(arith.cmpi(arith.CmpIPredicate.uge, ki, c(max_concurrent_steps, index))):
+          is_not_primed = arith.cmpi(arith.CmpIPredicate.uge, ki, c(max_concurrent_steps, index))
+          is_not_first_step = arith.cmpi(arith.CmpIPredicate.ne, mn_step_idx, c(0, index))
+          with mgpu.when(arith.ori(is_not_first_step, is_not_primed)):
             ab_empty_barriers[slot].wait()
           full_barrier = ab_full_barriers[slot]
           with mgpu.when(is_leader_block):
@@ -152,20 +156,17 @@ def build_kernel(
               gmem_transform=mgpu.TileTransform(tiling),
               **common_args,
           )
-        for ki in range(k_loop_iter - max_concurrent_steps, k_loop_iter - 1):
-          slot = ki % max_concurrent_steps
-          ab_empty_barriers[slot].wait()
 
       with mgpu.when(arith.andi(is_leader_of(MMA_WARP), is_leader_block)):
-        with mgpu.when(arith.cmpi(arith.CmpIPredicate.ne, mn_step_idx, c(0, index))):
-          tmem_read_done_barrier.wait()
+        with mgpu.when(arith.cmpi(arith.CmpIPredicate.uge, mn_step_idx, c(2, index))):
+          tmem_read_done_barrier[mn_slot].wait()
           llvm.inline_asm(ir.Type.parse("!llvm.void"), [], "tcgen05.fence::after_thread_sync;", "", has_side_effects=True)
         @mgpu.fori(c(k_loop_iter, index), arith.constant(i1, 0))
         def _mma_body(ki, accumulate):
           slot = arith.remui(ki, c(max_concurrent_steps, index))
           ab_full_barriers[slot].wait()
           tcgen05.mma(
-              acc,
+              mn_acc,
               mgpu.memref_slice(a_smem, slot),
               mgpu.memref_transpose(mgpu.memref_slice(b_smem, slot), (1, 0, 3, 2)),
               a_swizzle=swizzle,
@@ -177,27 +178,19 @@ def build_kernel(
           is_last_iter = arith.cmpi(
               arith.CmpIPredicate.eq, ki, c(k_loop_iter - 1, index)
           )
-          barrier_ptr = arith.select(
-              is_last_iter,
-              mma_done_barrier.get_ptr(),
-              ab_empty_barriers[slot].get_ptr(),
-          )
-          tcgen05.commit_arrive(barrier_ptr, collective=collective, ctx=ctx)
+          tcgen05.commit_arrive(ab_empty_barriers[slot], collective=collective, ctx=ctx)
+          with mgpu.when(is_last_iter):
+            tcgen05.commit_arrive(mma_done_barrier[mn_slot], collective=collective, ctx=ctx)
           return accumulate
 
       # Second warpgroup
       with mgpu.when(arith.cmpi(arith.CmpIPredicate.uge, warp_idx, c(4, i32))):
-        mma_done_barrier.wait(for_tensor_core=True)
+        mma_done_barrier[mn_slot].wait(for_tensor_core=True)
         # We need to pack before we signal or else we will run out of registers.
-        final_acc = acc.load().astype(ir.F16Type.get())
-        final_acc = mgpu.optimization_barrier(final_acc)
+        final_acc = mn_acc.load().astype(ir.F16Type.get())
         assert tile_n % epilogue_tile_n == 0
         for i in range(tile_n // epilogue_tile_n):
           final_acc[:, ds(i * epilogue_tile_n, epilogue_tile_n)].store_tiled(d_smem, swizzle=swizzle)
-          if i == 0:
-            llvm.inline_asm(ir.Type.parse("!llvm.void"), [], "tcgen05.wait::ld.sync.aligned;", "", has_side_effects=True)
-            llvm.inline_asm(ir.Type.parse("!llvm.void"), [], "tcgen05.fence::before_thread_sync;", "", has_side_effects=True)
-            tmem_read_done_barrier.arrive()
           mgpu.commit_shared()
           store_n_start = arith.addi(n_start, c(i * epilogue_tile_n, index))
           ctx.async_copy(
@@ -208,8 +201,11 @@ def build_kernel(
               swizzle=swizzle,
           )
           ctx.await_async_copy(0, await_read_only=True)
+        llvm.inline_asm(ir.Type.parse("!llvm.void"), [], "tcgen05.wait::ld.sync.aligned;", "", has_side_effects=True)
+        llvm.inline_asm(ir.Type.parse("!llvm.void"), [], "tcgen05.fence::before_thread_sync;", "", has_side_effects=True)
+        tmem_read_done_barrier[mn_slot].arrive()
 
-  epilogue_tile_n = 128
+  epilogue_tile_n = 64
   compute_buffers = (
     jax.ShapeDtypeStruct(
         mgpu.tile_shape((max_concurrent_steps, block_tile_m, tile_k), tiling),
@@ -225,9 +221,9 @@ def build_kernel(
   smem = (
       smem_buffers,
       [mgpu.Barrier(arrival_count=1, num_barriers=max_concurrent_steps)] * 2,
-      mgpu.Barrier(arrival_count=1),
-      mgpu.Barrier(arrival_count=128),
-      mgpu.TMEM((128, tile_n), jnp.float32, collective=collective),
+      mgpu.Barrier(arrival_count=1, num_barriers=2),
+      mgpu.Barrier(arrival_count=128, num_barriers=2),
+      mgpu.TMEM((128, 2 * tile_n), jnp.float32, collective=collective, ),
   )
   num_sms = 148
   return mgpu.as_gpu_kernel(
@@ -246,14 +242,15 @@ def build_kernel(
 
 def main(unused_argv):
   m, k, n = 8192, 4096, 8192
+  # m, k, n = 4 * 256, 256, 256 * 20
 
   ka, kb = jr.split(jr.key(0), 2)
   a = jr.normal(key=ka, shape=(m, k), dtype=jnp.float16)
   b = jr.normal(key=kb, shape=(n, k), dtype=jnp.float16)
 
   tile_m = (128,)
-  tile_n = (128, 256,)
-  max_concurrent_steps = (2, 4, 5, 6)
+  tile_n = (128,)
+  max_concurrent_steps = (2, 4, 5, 6, 8)
   grid_tile_m = (1, 2, 4, 8, 16)
   collective = (True,)
   configs = itertools.product(collective, tile_m, tile_n, grid_tile_m, max_concurrent_steps)
@@ -289,7 +286,7 @@ def main(unused_argv):
   # if not best_kwargs:
   #   raise ValueError("No valid configuration found")
   best_kwargs = dict(
-    collective=True, tile_m=128, tile_n=256, grid_tile_m=16, max_concurrent_steps=4
+    collective=True, tile_m=128, tile_n=128, grid_tile_m=16, max_concurrent_steps=6
   )
 
   with mlir.make_ir_context(), ir.Location.unknown():

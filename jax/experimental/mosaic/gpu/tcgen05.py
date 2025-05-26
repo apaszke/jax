@@ -582,7 +582,7 @@ def _infer_tmem_layout(
         "Can only infer TMEM layout for shapes with column count that's a"
         f" multiple of 8, got: {shape[1]}"
     )
-  if collective and shape[1] == 512:
+  if False and collective and shape[1] == 512:
     return TMEMLayout(
         elements_in_tile=(shape[0], 128), column_tile_stride=2, packing=packing
     )
@@ -658,6 +658,8 @@ class TMEMRef:
     col_idx = base_idx[1]
     if not isinstance(col_idx, ir.Value):
       col_idx = arith.constant(i32, col_idx)
+    if ir.IndexType.isinstance(col_idx.type):
+      col_idx = arith.index_castui(i32, col_idx)
     if packing != 1:
       col_idx = arith.divui(col_idx, arith.constant(i32, packing))
     return TMEMRef(
