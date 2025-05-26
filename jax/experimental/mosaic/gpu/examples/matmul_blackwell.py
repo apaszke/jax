@@ -123,19 +123,6 @@ def build_kernel(
     with ir.InsertionPoint.at_block_begin(after_block):
       [mn_step_idx, lx, ly, lz] = after_block.arguments
       # run the body below
-      with mgpu.when(is_leader_of(TMA_WARP)):
-          cancel_barrier.arrive_expect_tx(16)
-          llvm.inline_asm(
-                  ir.Type.parse("!llvm.void"),
-                  [utils.memref_ptr(cancel_info, memory_space=3), cancel_barrier.get_ptr(), is_leader_block],
-                  "@$2 clusterlaunchcontrol.try_cancel.async.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [$0], [$1];",
-                  "r,r,b",
-                  has_side_effects=True
-          )
-      mn_step_idx = arith.addi(mn_step_idx, c(1, index))
-      scf.yield_([mn_step_idx, lx, ly, lz])
-
-    if False:
       m_idx = arith.addi(lx, arith.muli(lz, c(grid_tile_m, index)))
       n_idx = ly
 
@@ -184,6 +171,14 @@ def build_kernel(
               gmem_transform=mgpu.TileTransform(tiling),
               **common_args,
           )
+        cancel_barrier.arrive_expect_tx(16)
+        llvm.inline_asm(
+                ir.Type.parse("!llvm.void"),
+                [utils.memref_ptr(cancel_info, memory_space=3), cancel_barrier.get_ptr(), is_leader_block],
+                "@$2 clusterlaunchcontrol.try_cancel.async.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [$0], [$1];",
+                "r,r,b",
+                has_side_effects=True
+        )
 
       with mgpu.when(arith.andi(is_leader_of(MMA_WARP), is_leader_block)):
         with mgpu.when(arith.cmpi(arith.CmpIPredicate.uge, mn_step_idx, c(2, index))):
@@ -232,6 +227,10 @@ def build_kernel(
         llvm.inline_asm(ir.Type.parse("!llvm.void"), [], "tcgen05.wait::ld.sync.aligned;", "", has_side_effects=True)
         llvm.inline_asm(ir.Type.parse("!llvm.void"), [], "tcgen05.fence::before_thread_sync;", "", has_side_effects=True)
         tmem_read_done_barrier[mn_slot].arrive()
+
+      mn_step_idx = arith.addi(mn_step_idx, c(1, index))
+      scf.yield_([mn_step_idx, lx, ly, lz])
+
 
   epilogue_tile_n = 64
   compute_buffers = (
