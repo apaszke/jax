@@ -24,10 +24,12 @@ from jax._src.lib.mlir.dialects import arith
 from jax._src.lib.mlir.dialects import gpu
 from jax._src.lib.mlir.dialects import nvvm
 from jax._src.lib.mlir.dialects import llvm
+from jax._src.lib.mlir.dialects import scf
 from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.mosaic.gpu import c, ds
 from jax.experimental.mosaic.gpu import tcgen05
 from jax.experimental.mosaic.gpu import profiler
+from jax.experimental.mosaic.gpu import utils
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -80,7 +82,7 @@ def build_kernel(
     raise ValueError(f"{m=} // {tile_m=} must be divisible by {grid_tile_m=}")
 
   def kernel(ctx, a, b, d, smem):
-    ((a_smem, b_smem), d_smem), barriers, mma_done_barrier, tmem_read_done_barrier, acc = smem
+    ((a_smem, b_smem), d_smem), cancel_info, cancel_barrier, barriers, mma_done_barrier, tmem_read_done_barrier, acc = smem
     (ab_full_barriers, ab_empty_barriers) = barriers
 
     warp_idx = mgpu.warp_idx(sync=True)
@@ -88,26 +90,52 @@ def build_kernel(
     is_leader_of = lambda i: arith.andi(arith.cmpi(arith.CmpIPredicate.eq, warp_idx, c(i, i32)), is_warp_leader)
     is_leader_block = arith.cmpi(arith.CmpIPredicate.eq, ctx.cluster_idx(gpu.Dimension.x), c(0, index))
 
+    while_op = scf.WhileOp([index] * 4, [c(0, index), *map(gpu.block_id, gpu.Dimension)])
+    before_block = while_op.before.blocks.append(index, index, index, index)
+    with ir.InsertionPoint.at_block_begin(before_block):
+      [mn_step_idx, lx, ly, lz] = before_block.arguments
+      is_first_step = arith.cmpi(arith.CmpIPredicate.eq, mn_step_idx, c(0, index))
+      if_op = scf.IfOp(is_first_step, [i1] + [index] * 3, hasElse=True)
+      with ir.InsertionPoint(if_op.then_block):
+        scf.yield_([c(1, i1), lx, ly, lz])
+      with ir.InsertionPoint(if_op.else_block):
+        cancel_barrier.wait()
+        info_struct = llvm.inline_asm(
+                ir.Type.parse("!llvm.struct<(i1, i32, i32, i32)>"),
+                [utils.memref_ptr(cancel_info, memory_space=3)],
+                """
+                {
+                  .reg .b128 handle;
+                  ld.shared.b128 handle, [$4];
+                  clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 $0, handle;
+                  clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {$1, $2, $3, _}, handle;
+                }
+                """,
+                "=b,=r,=r,=r,r")
+        is_cancelled = llvm.extractvalue(i1, info_struct, [0])
+        ls = [llvm.extractvalue(i32, info_struct, [i]) for i in range(1, 4)]
+        ls = [arith.index_castui(index, l) for l in ls]
+        ls[0] = arith.addi(ls[0], gpu.cluster_block_id(gpu.Dimension.x))
+        scf.yield_([is_cancelled, *ls])
+      is_cancelled, lx, ly, lz = if_op.results
+      scf.condition(is_cancelled, [mn_step_idx, lx, ly, lz])
+    after_block = while_op.after.blocks.append(index, index, index, index)
+    with ir.InsertionPoint.at_block_begin(after_block):
+      [mn_step_idx, lx, ly, lz] = after_block.arguments
+      # run the body below
+      with mgpu.when(is_leader_of(TMA_WARP)):
+          cancel_barrier.arrive_expect_tx(16)
+          llvm.inline_asm(
+                  ir.Type.parse("!llvm.void"),
+                  [utils.memref_ptr(cancel_info, memory_space=3), cancel_barrier.get_ptr(), is_leader_block],
+                  "@$2 clusterlaunchcontrol.try_cancel.async.mbarrier::complete_tx::bytes.multicast::cluster::all.b128 [$0], [$1];",
+                  "r,r,b",
+                  has_side_effects=True
+          )
+      mn_step_idx = arith.addi(mn_step_idx, c(1, index))
+      scf.yield_([mn_step_idx, lx, ly, lz])
 
-    logical_grid = (grid_tile_m, n // tile_n, m // (block_tile_m * grid_tile_m))
-    logical_grid_size = math.prod(logical_grid)
-    sm_id = gpu.block_id(gpu.Dimension.x)
-    extra_step = arith.cmpi(arith.CmpIPredicate.slt, sm_id, c(logical_grid_size % num_sms, index))
-    mn_steps = arith.addi(
-        mgpu.c(logical_grid_size // num_sms, index),
-        arith.index_castui(index, extra_step))
-
-    @mgpu.fori(mn_steps, None)
-    def mn_loop(mn_step_idx, _):
-      # NOTE: we interpret the logical grid in column-major order
-      idx = arith.addi(sm_id, arith.muli(mn_step_idx, mgpu.c(num_sms, index)))
-      logical_idxs = []
-      for dim_size in logical_grid:
-        logical_idxs.append(arith.remui(idx, mgpu.c(dim_size, index)))
-        idx = arith.divui(idx, mgpu.c(dim_size, index))
-      del idx
-      lx, ly, lz = logical_idxs
-
+    if False:
       m_idx = arith.addi(lx, arith.muli(lz, c(grid_tile_m, index)))
       n_idx = ly
 
@@ -220,15 +248,18 @@ def build_kernel(
   smem_buffers = [compute_buffers, epilogue_buffer]
   smem = (
       smem_buffers,
+      jax.ShapeDtypeStruct((16,), jnp.uint8),
+      mgpu.Barrier(arrival_count=1),
       [mgpu.Barrier(arrival_count=1, num_barriers=max_concurrent_steps)] * 2,
       mgpu.Barrier(arrival_count=1, num_barriers=2),
       mgpu.Barrier(arrival_count=128, num_barriers=2),
       mgpu.TMEM((128, 2 * tile_n), jnp.float32, collective=collective, ),
   )
   num_sms = 148
+  logical_grid = (grid_tile_m, n // tile_n, m // (block_tile_m * grid_tile_m))
   return mgpu.as_gpu_kernel(
       kernel,
-      (num_sms, 1, 1),
+      logical_grid,
       (2 * 128, 1, 1),
       (
           jax.ShapeDtypeStruct((m, k), jnp.float16),
