@@ -939,11 +939,11 @@ def as_torch_gpu_kernel(
       body, grid, block, in_shape, out_shape, smem_scratch_shape, prof_spec,
       cluster, module_name, kernel_name, thread_semantics, inout_shape
   )
-  if is_device_collective:
-    raise RuntimeError(
-        "Kernel is a cross-device collective but no support is available for"
-        " Torch."
-    )
+  # if is_device_collective:
+  #   raise RuntimeError(
+  #       "Kernel is a cross-device collective but no support is available for"
+  #       " Torch."
+  #   )
   module = _run_serde_pass(module, serialize=True, ir_version=None)
   return _as_torch_gpu_kernel(
       module.operation.get_asm(binary=True, enable_debug_info=True),
